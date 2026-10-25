@@ -50,7 +50,38 @@ router.post("/start", async (req, res, next) => {
         next(error);
     }
 });
+// GET /api/assessments/history
+router.get("/history", async (req, res, next) => {
+    try {
+        const attempts = await AssessmentAttempt.find({
+            user: req.user.id,
+        })
+            .select(
+                "status questionIds answers scores startedAt submittedAt createdAt"
+            )
+            .sort({ startedAt: -1, createdAt: -1 })
+            .limit(50)
+            .lean();
 
+        return res.json({
+            success: true,
+            data: {
+                attempts: attempts.map((attempt) => ({
+                    id: attempt._id.toString(),
+                    status: attempt.status,
+                    questionCount: attempt.questionIds?.length ?? 0,
+                    answeredCount: attempt.answers?.length ?? 0,
+                    scores: attempt.scores ?? {},
+                    startedAt: attempt.startedAt,
+                    submittedAt: attempt.submittedAt,
+                    createdAt: attempt.createdAt,
+                })),
+            },
+        });
+    } catch (error) {
+        next(error);
+    }
+});
 // GET /api/assessments/:attemptId
 router.get("/:attemptId", async (req, res, next) => {
     try {

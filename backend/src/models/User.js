@@ -24,7 +24,16 @@ const userSchema = new mongoose.Schema(
             required: true,
             select: false,
         },
-
+        education: {
+            type: String,
+            default: "",
+            maxlength: 120,
+        },
+        interests: {
+            type: String,
+            default: "",
+            maxlength: 1000,
+        },
         role: {
             type: String,
             enum: ["student", "admin", "counsellor"],

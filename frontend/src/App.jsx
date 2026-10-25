@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import {
   ArrowDownRight,
   ArrowRight,
@@ -32,9 +32,11 @@ import {
   Route,
   Routes,
   useNavigate,
+  useLocation,
   useParams,
 } from "react-router-dom";
 import AppLayout from "./components/AppLayout";
+import { apiRequest } from "./lib/api";
 import { assessmentQuestions, careers, resources } from "./data/mockData";
 import "./styles.css";
 
@@ -94,6 +96,92 @@ function ProgressBar({ value, color = "blue" }) {
   );
 }
 
+function useSavedRoadmapSummary() {
+  const [summary, setSummary] = useState({
+    completed: 0,
+    total: 0,
+    percent: 0,
+    trackedCareers: 0,
+    perCareer: [],
+  });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadProgress() {
+      try {
+        const token = sessionStorage.getItem("careerNavigatorToken");
+
+        if (!token) {
+          throw new Error("Please log in to view your progress.");
+        }
+
+        const results = await Promise.all(
+          careers.map(async (career) => {
+            const result = await apiRequest(
+              `/roadmaps/${career.slug}/progress`,
+              { token, signal: controller.signal }
+            );
+
+            const saved = result.data?.completedSteps;
+
+            if (!Array.isArray(saved)) {
+              throw new Error(`Invalid progress returned for ${career.title}.`);
+            }
+
+            const validSteps = [...new Set(saved)].filter((id) => {
+              const match = /^step-(\d+)$/.exec(id);
+              return match && Number(match[1]) < career.roadmap.length;
+            });
+
+            return {
+              slug: career.slug,
+              title: career.title,
+              completed: validSteps.length,
+              total: career.roadmap.length,
+              percent: career.roadmap.length
+                ? Math.round((validSteps.length / career.roadmap.length) * 100)
+                : 0,
+            };
+          })
+        );
+
+        if (controller.signal.aborted) return;
+
+        const completed = results.reduce(
+          (sum, item) => sum + item.completed,
+          0
+        );
+        const total = results.reduce((sum, item) => sum + item.total, 0);
+
+        setSummary({
+          completed,
+          total,
+          percent: total ? Math.round((completed / total) * 100) : 0,
+          trackedCareers: results.filter((item) => item.completed > 0).length,
+          perCareer: results,
+        });
+      } catch (err) {
+        if (err.name !== "AbortError" && !controller.signal.aborted) {
+          setError(err.message || "Unable to load saved roadmap progress.");
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadProgress();
+
+    return () => controller.abort();
+  }, []);
+
+  return { summary, loading, error };
+}
+
 function CareerCard({ career, rank }) {
   return (
     <article className="career-card">
@@ -112,9 +200,13 @@ function CareerCard({ career, rank }) {
       <div className="match-track">
         <ProgressBar value={career.match} />
       </div>
-      <Link className="text-link" to={`/app/careers/${career.slug}`}>
-        Explore career <ArrowRight size={15} />
-      </Link>
+      {career.detailAvailable === false ? (
+        <span className="text-link">Career details coming soon</span>
+      ) : (
+        <Link className="text-link" to={`/app/careers/${career.slug}`}>
+          Explore career <ArrowRight size={15} />
+        </Link>
+      )}
     </article>
   );
 }
@@ -339,6 +431,7 @@ function LandingPage() {
 
 function AuthPage({ register = false }) {
   const [form, setForm] = useState({ name: "", email: "", password: "" });
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const navigate = useNavigate();
 
@@ -349,7 +442,7 @@ function AuthPage({ register = false }) {
     }));
   }
 
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
     setError("");
 
@@ -357,16 +450,54 @@ function AuthPage({ register = false }) {
       setError("Enter your name to continue.");
       return;
     }
+
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) {
       setError("Enter a valid email address.");
       return;
     }
+
     if (form.password.length < 8) {
-      setError("Use at least 8 characters for this demo password.");
+      setError("Use a password with at least 8 characters.");
       return;
     }
 
-    navigate("/app/dashboard");
+    setSubmitting(true);
+
+    try {
+      const result = await apiRequest(
+        register ? "/auth/register" : "/auth/login",
+        {
+          method: "POST",
+          body: {
+            ...(register ? { name: form.name.trim() } : {}),
+            email: form.email.trim().toLowerCase(),
+            password: form.password,
+          },
+        }
+      );
+
+      const token = result.token ?? result.data?.token;
+      const user = result.user ?? result.data?.user;
+
+      if (!token) {
+        console.error("Unexpected authentication response:", result);
+        throw new Error(
+          "The server response did not contain a token. Check the browser console."
+        );
+      }
+
+      sessionStorage.setItem("careerNavigatorToken", token);
+
+      if (user) {
+        sessionStorage.setItem("careerNavigatorUser", JSON.stringify(user));
+      }
+
+      navigate("/app/dashboard", { replace: true });
+    } catch (err) {
+      setError(err.message || "Authentication failed. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -397,8 +528,7 @@ function AuthPage({ register = false }) {
         <div className="demo-notice">
           <ShieldCheck size={17} />
           <span>
-            Prototype mode: this form does not create or authenticate a real
-            account.
+            Your account is authenticated by the Career Navigator backend.
           </span>
         </div>
 
@@ -455,9 +585,17 @@ function AuthPage({ register = false }) {
               {error}
             </div>
           )}
-          <button className="button button-primary button-full" type="submit">
-            {register ? "Create demo profile" : "Enter demo workspace"}{" "}
-            <ArrowRight size={17} />
+          <button
+            className="button button-primary button-full"
+            type="submit"
+            disabled={submitting}
+          >
+            {submitting
+              ? "Please wait..."
+              : register
+              ? "Create account"
+              : "Log in"}
+            {!submitting && <ArrowRight size={17} />}
           </button>
         </form>
         <div className="auth-switch">
@@ -476,6 +614,164 @@ function AuthPage({ register = false }) {
 }
 
 function Dashboard() {
+  const [attempts, setAttempts] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState("");
+  const [dashboardRecommendations, setDashboardRecommendations] = useState([]);
+  const [recommendationsLoading, setRecommendationsLoading] = useState(true);
+  const [recommendationsError, setRecommendationsError] = useState("");
+  const {
+    summary: roadmapSummary,
+    loading: roadmapLoading,
+    error: roadmapError,
+  } = useSavedRoadmapSummary();
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadDashboardHistory() {
+      try {
+        const token = sessionStorage.getItem("careerNavigatorToken");
+
+        if (!token) {
+          throw new Error("Please log in again.");
+        }
+
+        const result = await apiRequest("/assessments/history", {
+          token,
+          signal: controller.signal,
+        });
+
+        if (!Array.isArray(result.data?.attempts)) {
+          throw new Error("Unable to read assessment history.");
+        }
+
+        setAttempts(result.data.attempts);
+      } catch (err) {
+        if (err.name !== "AbortError" && !controller.signal.aborted) {
+          setHistoryError(
+            err.message || "Unable to load dashboard statistics."
+          );
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setHistoryLoading(false);
+        }
+      }
+    }
+
+    loadDashboardHistory();
+
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadDashboardRecommendations() {
+      try {
+        const token = sessionStorage.getItem("careerNavigatorToken");
+
+        if (!token) {
+          throw new Error("Please log in to view career recommendations.");
+        }
+
+        const result = await apiRequest("/recommendations/current", {
+          token,
+          signal: controller.signal,
+        });
+
+        const payload = result.data ?? result;
+        const items = Array.isArray(payload)
+          ? payload
+          : payload.recommendations ??
+            payload.data?.recommendations ??
+            result.recommendations ??
+            [];
+
+        if (!Array.isArray(items)) {
+          throw new Error("Invalid recommendations response.");
+        }
+
+        const mapped = items.map((item, index) => {
+          const career =
+            item.career && typeof item.career === "object"
+              ? item.career
+              : item.profile ?? item;
+
+          const title =
+            career.title ??
+            career.name ??
+            item.title ??
+            item.name ??
+            (typeof item.career === "string" ? item.career : null) ??
+            `Career ${index + 1}`;
+
+          const localCareer = careers.find(
+            (entry) =>
+              entry.title.toLowerCase() === title.toLowerCase() ||
+              entry.slug === career.slug ||
+              entry.slug === item.slug
+          );
+
+          const rawScore = Number(
+            item.matchScore ?? item.match ?? item.score ?? item.similarity ?? 0
+          );
+
+          const match = Math.round(
+            Math.max(
+              0,
+              Math.min(100, rawScore <= 1 ? rawScore * 100 : rawScore)
+            )
+          );
+
+          return {
+            title,
+            category:
+              career.category ?? item.category ?? "Career recommendation",
+            match,
+            slug: localCareer?.slug,
+            description:
+              career.description ??
+              item.explanation ??
+              "Explore this career to learn more about its skills and opportunities.",
+          };
+        });
+
+        if (!controller.signal.aborted) {
+          setDashboardRecommendations(mapped);
+        }
+      } catch (err) {
+        if (err.name !== "AbortError" && !controller.signal.aborted) {
+          setRecommendationsError(
+            err.message || "Unable to load career recommendations."
+          );
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setRecommendationsLoading(false);
+        }
+      }
+    }
+
+    loadDashboardRecommendations();
+
+    return () => controller.abort();
+  }, []);
+
+  const latestAttempt = attempts[0];
+  const completedAttempts = attempts.filter(
+    (attempt) => attempt.status === "completed"
+  );
+
+  const assessmentStatus = latestAttempt
+    ? latestAttempt.status === "completed"
+      ? "Completed"
+      : "In progress"
+    : "Not started";
+
+  const assessmentDetail = latestAttempt
+    ? `${latestAttempt.answeredCount} of ${latestAttempt.questionCount} questions answered`
+    : "17 questions available";
   return (
     <>
       <PageHeader
@@ -516,102 +812,179 @@ function Dashboard() {
         <StatCard
           icon={Target}
           label="Assessment status"
-          value="Not completed"
-          detail="5 demo questions available"
+          value={
+            historyLoading
+              ? "Loading..."
+              : latestAttempt
+              ? latestAttempt.status === "completed"
+                ? "Completed"
+                : "In progress"
+              : "Not started"
+          }
+          detail={
+            latestAttempt
+              ? `${latestAttempt.answeredCount} of ${latestAttempt.questionCount} questions answered`
+              : "17 questions available"
+          }
           tone="blue"
         />
+
         <StatCard
-          icon={Sparkles}
-          label="Career matches"
-          value="5 options"
-          detail="Illustrative sample recommendations"
+          icon={CheckCircle2}
+          label="Completed assessments"
+          value={historyLoading ? "—" : completedAttempts.length}
+          detail="Saved assessment attempts"
           tone="mint"
         />
+
         <StatCard
           icon={BookOpen}
           label="Roadmap progress"
-          value="20%"
-          detail="1 of 5 demo milestones"
+          value={roadmapLoading ? "Loading..." : `${roadmapSummary.percent}%`}
+          detail={
+            roadmapLoading
+              ? "Loading saved milestones"
+              : `${roadmapSummary.completed} of ${roadmapSummary.total} milestones completed`
+          }
           tone="purple"
         />
+
         <StatCard
-          icon={Award}
-          label="Learning activity"
-          value="2 hours"
-          detail="Sample activity, not tracked time"
+          icon={Sparkles}
+          label="Career matches"
+          value={
+            recommendationsLoading
+              ? "Loading..."
+              : dashboardRecommendations.length
+          }
+          detail="Returned by the recommendation service"
           tone="orange"
         />
       </div>
 
+      {(historyError || roadmapError || recommendationsError) && (
+        <div className="form-error" role="alert">
+          {historyError || roadmapError || recommendationsError}
+        </div>
+      )}
+
+      {historyError && (
+        <div className="form-error" role="alert">
+          {historyError}
+        </div>
+      )}
+
       <div className="dashboard-grid">
         <section className="panel recommendation-panel">
           <SectionHeading
-            title="Explore your career matches"
-            subtitle="A preview of possible directions"
+            title="Your career matches"
+            subtitle="Recommendations based on your completed assessment"
             action={
               <Link className="text-link" to="/app/recommendations/latest">
                 View all <ArrowRight size={15} />
               </Link>
             }
           />
-          <div className="mini-career-list">
-            {careers.slice(0, 3).map((career, index) => (
-              <div className="mini-career" key={career.slug}>
-                <div className={`mini-career-icon mini-tone-${index}`}>
-                  <BriefcaseBusiness size={19} />
+          {recommendationsLoading ? (
+            <p>Loading your career matches...</p>
+          ) : recommendationsError ? (
+            <p className="form-error" role="alert">
+              {recommendationsError}
+            </p>
+          ) : dashboardRecommendations.length === 0 ? (
+            <div className="empty-note">
+              Complete your assessment to see your personalized career matches.
+              <Link className="text-link" to="/app/assessment">
+                Start assessment <ArrowRight size={15} />
+              </Link>
+            </div>
+          ) : (
+            <div className="mini-career-list">
+              {dashboardRecommendations.slice(0, 3).map((career, index) => (
+                <div className="mini-career" key={`${career.title}-${index}`}>
+                  <div className={`mini-career-icon mini-tone-${index}`}>
+                    <BriefcaseBusiness size={19} />
+                  </div>
+
+                  <div className="mini-career-info">
+                    <strong>{career.title}</strong>
+                    <span>{career.category}</span>
+                  </div>
+
+                  <div className="mini-match">
+                    {career.match}%<small>match</small>
+                  </div>
+
+                  <Link
+                    className="mini-arrow"
+                    to={
+                      career.slug
+                        ? `/app/careers/${career.slug}`
+                        : "/app/recommendations/latest"
+                    }
+                    aria-label={`Explore ${career.title}`}
+                  >
+                    <ArrowUpRight size={18} />
+                  </Link>
                 </div>
-                <div className="mini-career-info">
-                  <strong>{career.title}</strong>
-                  <span>{career.category}</span>
-                </div>
-                <div className="mini-match">
-                  {career.match}%<small>sample</small>
-                </div>
-                <Link
-                  className="mini-arrow"
-                  to={`/app/careers/${career.slug}`}
-                  aria-label={`Explore ${career.title}`}
-                >
-                  <ArrowUpRight size={18} />
-                </Link>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
           <p className="data-disclaimer">
-            These scores are illustrative demo values, not model-generated
-            predictions.
+            Match scores are exploratory guidance from the current prototype,
+            not guarantees of future career success.
           </p>
         </section>
 
         <section className="panel progress-panel">
           <SectionHeading
             title="Your roadmap"
-            subtitle="A sample learning plan"
+            subtitle="Your saved learning milestone progress"
           />
-          <div className="roadmap-progress">
-            <div className="roadmap-progress-top">
-              <span>Getting started</span>
-              <strong>20%</strong>
-            </div>
-            <ProgressBar value={20} color="mint" />
-            <p>One milestone is marked complete in this preview.</p>
-          </div>
-          {[
-            "Explore your interests",
-            "Choose a career direction",
-            "Build foundational skills",
-          ].map((item, index) => (
-            <div className="task-row" key={item}>
-              <span className={`task-check${index === 0 ? " checked" : ""}`}>
-                {index === 0 && <Check size={13} />}
-              </span>
-              <span>{item}</span>
-              {index === 0 && <small>Done</small>}
-            </div>
-          ))}
-          <Link className="text-link roadmap-link" to="/app/roadmap">
-            Open roadmap <ArrowRight size={15} />
-          </Link>
+
+          {roadmapLoading ? (
+            <p>Loading roadmap progress...</p>
+          ) : roadmapError ? (
+            <p className="form-error" role="alert">
+              {roadmapError}
+            </p>
+          ) : (
+            <>
+              <div className="roadmap-progress">
+                <div className="roadmap-progress-top">
+                  <span>Across available career roadmaps</span>
+                  <strong>{roadmapSummary.percent}%</strong>
+                </div>
+
+                <ProgressBar value={roadmapSummary.percent} color="mint" />
+
+                <p>
+                  {roadmapSummary.completed} of {roadmapSummary.total}{" "}
+                  milestones completed across {roadmapSummary.perCareer.length}{" "}
+                  career roadmaps.
+                </p>
+              </div>
+
+              {roadmapSummary.perCareer
+                .filter((item) => item.completed > 0)
+                .slice(0, 3)
+                .map((item) => (
+                  <div className="breakdown-row" key={item.slug}>
+                    <div>
+                      <Link to="/app/roadmap" state={{ careerSlug: item.slug }}>
+                        {item.title}
+                      </Link>
+                      <strong>{item.percent}%</strong>
+                    </div>
+                    <ProgressBar value={item.percent} color="mint" />
+                  </div>
+                ))}
+
+              <Link className="text-link roadmap-link" to="/app/roadmap">
+                Open roadmap <ArrowRight size={15} />
+              </Link>
+            </>
+          )}
         </section>
       </div>
 
@@ -667,203 +1040,479 @@ function ClipboardCheckIcon() {
 
 function Assessment() {
   const navigate = useNavigate();
+
+  const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
   const [current, setCurrent] = useState(0);
+  const [attemptId, setAttemptId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const question = assessmentQuestions[current];
-  const answered = Object.keys(answers).length;
-  const percent = Math.round((answered / assessmentQuestions.length) * 100);
 
-  function choose(optionIndex) {
-    setAnswers((previous) => ({ ...previous, [question.id]: optionIndex }));
+  const token = sessionStorage.getItem("careerNavigatorToken");
+  const question = questions[current];
+
+  const answered = Object.keys(answers).length;
+  const percent = questions.length
+    ? Math.round((answered / questions.length) * 100)
+    : 0;
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadAssessment() {
+      try {
+        if (!token) {
+          navigate("/login", { replace: true });
+          return;
+        }
+
+        const questionResult = await apiRequest("/assessments/questions", {
+          token,
+          signal: controller.signal,
+        });
+
+        const questionList = questionResult.data?.questions;
+
+        if (!Array.isArray(questionList) || questionList.length === 0) {
+          throw new Error("The server returned no assessment questions.");
+        }
+
+        const attemptResult = await apiRequest("/assessments/start", {
+          method: "POST",
+          token,
+          signal: controller.signal,
+        });
+
+        const newAttemptId = attemptResult.data?.attemptId;
+
+        if (!newAttemptId) {
+          throw new Error(
+            "The server did not return an assessment attempt ID."
+          );
+        }
+
+        setQuestions(questionList);
+        setAttemptId(newAttemptId);
+      } catch (err) {
+        if (err.name !== "AbortError") {
+          setError(err.message || "Unable to load the assessment.");
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadAssessment();
+
+    return () => controller.abort();
+  }, [token, navigate]);
+
+  function choose(value) {
+    setAnswers((previous) => ({
+      ...previous,
+      [question.id]: value,
+    }));
     setError("");
   }
 
-  function next() {
+  async function next() {
     if (answers[question.id] === undefined) {
-      setError("Choose an answer before continuing.");
+      setError("Please select an answer before continuing.");
       return;
     }
-    if (current < assessmentQuestions.length - 1) {
+
+    if (current < questions.length - 1) {
       setCurrent((value) => value + 1);
-    } else {
-      navigate("/app/recommendations/latest");
+      return;
+    }
+
+    setSubmitting(true);
+    setError("");
+
+    try {
+      const answersArray = questions.map((item) => ({
+        questionId: item.id,
+        answer: answers[item.id],
+      }));
+
+      await apiRequest(`/assessments/${attemptId}/submit`, {
+        method: "POST",
+        token,
+        body: {
+          answers: answersArray,
+        },
+      });
+
+      navigate("/app/recommendations/latest", {
+        replace: true,
+        state: { assessmentSubmitted: true },
+      });
+    } catch (err) {
+      setError(err.message || "Unable to submit your assessment.");
+    } finally {
+      setSubmitting(false);
     }
   }
 
+  if (loading) {
+    return (
+      <section className="panel">
+        <p>Loading your assessment...</p>
+      </section>
+    );
+  }
+
+  if (error && questions.length === 0) {
+    return (
+      <section className="panel">
+        <h2>Unable to load assessment</h2>
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+        <button
+          className="button button-primary"
+          onClick={() => window.location.reload()}
+        >
+          Try again
+        </button>
+      </section>
+    );
+  }
+
+  if (!question) return null;
+
+  const selected = answers[question.id];
+  const isRating = question.type === "rating";
+
   return (
-    <>
+    <section className="assessment-page">
       <PageHeader
         eyebrow="SELF-DISCOVERY"
         title="Career assessment"
-        description="A short demo assessment covering aptitude, interests, and academic strengths."
+        description="Explore your aptitude, interests, and academic strengths to help identify career paths worth considering."
       />
-      <div className="assessment-layout">
-        <section className="panel assessment-card">
-          <div className="assessment-topline">
-            <span>
-              QUESTION {current + 1} OF {assessmentQuestions.length}
-            </span>
-            <span>{percent}% answered</span>
-          </div>
-          <ProgressBar
-            value={((current + 1) / assessmentQuestions.length) * 100}
-          />
-          <div className="question-section">{question.section}</div>
-          <h2 className="question-title">{question.question}</h2>
-          <p className="question-hint">
-            Choose the option that best describes you. There are no trick
-            answers.
-          </p>
-          <div className="answer-list">
-            {question.options.map((option, index) => {
-              const selected = answers[question.id] === index;
-              return (
+
+      <div className="panel">
+        <div className="assessment-progress-header">
+          <span>
+            Question {current + 1} of {questions.length}
+          </span>
+          <span>{percent}% answered</span>
+        </div>
+
+        <div
+          className="progress-track"
+          role="progressbar"
+          aria-valuenow={percent}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div className="progress-fill" style={{ width: `${percent}%` }} />
+        </div>
+
+        <p className="eyebrow">{question.category}</p>
+        <h2>{question.question}</h2>
+
+        <div className="assessment-options">
+          {isRating
+            ? (
+                question.scale?.labels ?? [
+                  "Very low",
+                  "Low",
+                  "Moderate",
+                  "High",
+                  "Very high",
+                ]
+              ).map((label, index) => {
+                const value = index + 1;
+
+                return (
+                  <button
+                    type="button"
+                    key={value}
+                    className={`assessment-option${
+                      selected === value ? " selected" : ""
+                    }`}
+                    aria-pressed={selected === value}
+                    onClick={() => choose(value)}
+                  >
+                    <span>{value}</span> {label}
+                  </button>
+                );
+              })
+            : question.options.map((option) => (
                 <button
-                  key={option}
-                  className={`answer-option${selected ? " selected" : ""}`}
-                  onClick={() => choose(index)}
-                  aria-pressed={selected}
+                  type="button"
+                  key={option.id}
+                  className={`assessment-option${
+                    selected === option.id ? " selected" : ""
+                  }`}
+                  aria-pressed={selected === option.id}
+                  onClick={() => choose(option.id)}
                 >
-                  <span className="answer-letter">
-                    {String.fromCharCode(65 + index)}
-                  </span>
-                  <span>{option}</span>
-                  {selected && (
-                    <CheckCircle2 className="answer-selected-icon" size={19} />
-                  )}
+                  <span>{option.id.toUpperCase()}</span> {option.text}
                 </button>
-              );
-            })}
-          </div>
-          {error && (
-            <div className="form-error" role="alert">
-              {error}
-            </div>
-          )}
-          <div className="assessment-controls">
-            <button
-              className="button button-secondary"
-              disabled={current === 0}
-              onClick={() => setCurrent((value) => value - 1)}
-            >
-              Previous
-            </button>
-            <button className="button button-primary" onClick={next}>
-              {current === assessmentQuestions.length - 1
-                ? "View demo recommendations"
-                : "Next question"}{" "}
-              <ArrowRight size={16} />
-            </button>
-          </div>
-        </section>
-        <aside className="panel assessment-aside">
-          <div className="aside-icon">
-            <Lightbulb size={21} />
-          </div>
-          <h3>Why this assessment?</h3>
-          <p>
-            Career decisions are personal. This prototype combines several areas
-            of reflection rather than relying on one answer.
+              ))}
+        </div>
+
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
           </p>
-          <div className="assessment-topic">
-            <CheckCircle2 size={17} />
-            <span>
-              <strong>Aptitude</strong>
-              <small>Logical, numerical, and verbal preferences</small>
-            </span>
-          </div>
-          <div className="assessment-topic">
-            <CheckCircle2 size={17} />
-            <span>
-              <strong>Interests</strong>
-              <small>Activities and work environments you enjoy</small>
-            </span>
-          </div>
-          <div className="assessment-topic">
-            <CheckCircle2 size={17} />
-            <span>
-              <strong>Academic strengths</strong>
-              <small>Areas where you feel confident</small>
-            </span>
-          </div>
-          <div className="demo-notice aside-notice">
-            <CircleHelp size={17} />
-            <span>
-              Demo answers are held only in this page's React state. Persistence
-              will be implemented later.
-            </span>
-          </div>
-        </aside>
+        )}
+
+        <div className="assessment-actions">
+          <button
+            type="button"
+            className="button button-secondary"
+            disabled={current === 0 || submitting}
+            onClick={() => {
+              setCurrent((value) => value - 1);
+              setError("");
+            }}
+          >
+            Previous
+          </button>
+
+          <button
+            type="button"
+            className="button button-primary"
+            disabled={submitting}
+            onClick={next}
+          >
+            {submitting
+              ? "Submitting..."
+              : current === questions.length - 1
+              ? "Submit assessment"
+              : "Next question"}
+          </button>
+        </div>
       </div>
-    </>
+    </section>
   );
 }
 
 function Recommendations() {
   const [sort, setSort] = useState("match");
+  const [recommendations, setRecommendations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadRecommendations() {
+      try {
+        const token = sessionStorage.getItem("careerNavigatorToken");
+
+        if (!token) {
+          throw new Error("Please log in to view your recommendations.");
+        }
+
+        const result = await apiRequest("/recommendations/current", {
+          token,
+          signal: controller.signal,
+        });
+
+        const payload = result.data ?? result;
+
+        const items = Array.isArray(payload)
+          ? payload
+          : payload.recommendations ??
+            payload.data?.recommendations ??
+            result.recommendations ??
+            [];
+
+        if (!Array.isArray(items) || items.length === 0) {
+          throw new Error(
+            "No recommendations were returned. Complete your assessment first."
+          );
+        }
+
+        const mapped = items.map((item, index) => {
+          const career = item.career ?? item.profile ?? item;
+
+          const title =
+            career.title ??
+            career.name ??
+            item.title ??
+            item.name ??
+            `Career ${index + 1}`;
+
+          const existingCareer = careers.find(
+            (entry) =>
+              entry.title.toLowerCase() === title.toLowerCase() ||
+              entry.slug === career.slug
+          );
+
+          const rawScore = Number(
+            item.matchScore ??
+              item.match ??
+              item.score ??
+              item.similarity ??
+              career.matchScore ??
+              0
+          );
+
+          const match = Math.round(
+            Math.max(
+              0,
+              Math.min(100, rawScore <= 1 ? rawScore * 100 : rawScore)
+            )
+          );
+
+          const reasons = Array.isArray(item.reasons)
+            ? item.reasons.join(" ")
+            : typeof item.reasons === "string"
+            ? item.reasons
+            : "";
+
+          return {
+            ...career,
+            slug:
+              career.slug ??
+              item.slug ??
+              existingCareer?.slug ??
+              title
+                .toLowerCase()
+                .trim()
+                .replace(/[^a-z0-9]+/g, "-"),
+            title,
+            category:
+              career.category ?? item.category ?? "Career recommendation",
+            description:
+              career.description ??
+              item.explanation ??
+              reasons ??
+              existingCareer?.description ??
+              "Explore this career to learn more about its skills and opportunities.",
+            match,
+            detailAvailable: Boolean(existingCareer),
+          };
+        });
+
+        if (!controller.signal.aborted) {
+          setRecommendations(mapped);
+        }
+      } catch (err) {
+        if (err.name !== "AbortError" && !controller.signal.aborted) {
+          setError(err.message || "Unable to load career recommendations.");
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadRecommendations();
+
+    return () => controller.abort();
+  }, []);
+
   const sorted = useMemo(() => {
-    const copy = [...careers];
-    if (sort === "alphabetical")
+    const copy = [...recommendations];
+
+    if (sort === "alphabetical") {
       copy.sort((a, b) => a.title.localeCompare(b.title));
-    else copy.sort((a, b) => b.match - a.match);
+    } else {
+      copy.sort((a, b) => b.match - a.match);
+    }
+
     return copy;
-  }, [sort]);
+  }, [recommendations, sort]);
 
   return (
     <>
       <PageHeader
         eyebrow="YOUR POSSIBLE DIRECTIONS"
         title="Career recommendations"
-        description="Explore sample career options and the reasoning behind each suggestion."
+        description="Explore career matches generated from your completed assessment."
         action={
           <Link className="button button-secondary" to="/app/assessment">
             Retake assessment
           </Link>
         }
       />
-      <div className="demo-notice wide-notice">
-        <Lightbulb size={18} />
-        <span>
-          <strong>Sample results:</strong> these rankings are fixed demo data
-          and do not depend on your assessment answers yet.
-        </span>
-      </div>
-      <div className="recommendation-summary panel">
-        <div className="summary-emblem">
-          <Sparkles size={24} />
-        </div>
-        <div>
-          <strong>Your exploration shortlist</strong>
-          <p>
-            Use these examples to learn about different paths. A real score will
-            be produced only after the assessment and recommendation service are
-            integrated.
-          </p>
-        </div>
-        <div className="summary-count">
-          <strong>05</strong>
-          <span>Sample careers</span>
-        </div>
-      </div>
-      <div className="filter-row">
-        <span>{sorted.length} career paths</span>
-        <label className="sort-control">
-          Sort by
-          <select
-            value={sort}
-            onChange={(event) => setSort(event.target.value)}
+
+      {loading && (
+        <section className="panel">
+          <p>Analysing your assessment and loading career matches...</p>
+        </section>
+      )}
+
+      {!loading && error && (
+        <section className="panel empty-state">
+          <h2>Recommendations unavailable</h2>
+          <p>{error}</p>
+          <button
+            className="button button-primary"
+            type="button"
+            onClick={() => window.location.reload()}
           >
-            <option value="match">Sample match score</option>
-            <option value="alphabetical">Career name</option>
-          </select>
-        </label>
-      </div>
-      <div className="career-grid">
-        {sorted.map((career, index) => (
-          <CareerCard key={career.slug} career={career} rank={index + 1} />
-        ))}
-      </div>
+            Try again
+          </button>
+          <Link className="button button-secondary" to="/app/assessment">
+            Take assessment
+          </Link>
+        </section>
+      )}
+
+      {!loading && !error && (
+        <>
+          <div className="demo-notice wide-notice">
+            <Lightbulb size={18} />
+            <span>
+              These matches are guidance based on the current prototype's career
+              profiles, not guarantees of future career success.
+            </span>
+          </div>
+
+          <div className="recommendation-summary panel">
+            <div className="summary-emblem">
+              <Sparkles size={24} />
+            </div>
+            <div>
+              <strong>Your career shortlist</strong>
+              <p>
+                Compare the ranked options and explore which skills and learning
+                paths may suit your interests.
+              </p>
+            </div>
+            <div className="summary-count">
+              <strong>{String(sorted.length).padStart(2, "0")}</strong>
+              <span>Career matches</span>
+            </div>
+          </div>
+
+          <div className="filter-row">
+            <span>{sorted.length} career paths</span>
+            <label className="sort-control">
+              Sort by
+              <select
+                value={sort}
+                onChange={(event) => setSort(event.target.value)}
+              >
+                <option value="match">Match score</option>
+                <option value="alphabetical">Career name</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="career-grid">
+            {sorted.map((career, index) => (
+              <CareerCard
+                key={`${career.slug}-${index}`}
+                career={career}
+                rank={index + 1}
+              />
+            ))}
+          </div>
+        </>
+      )}
     </>
   );
 }
@@ -1024,7 +1673,11 @@ function CareerDetail() {
           title="Suggested next steps"
           subtitle="A sample progression to help you get started."
           action={
-            <Link className="text-link" to="/app/roadmap">
+            <Link
+              className="text-link"
+              to="/app/roadmap"
+              state={{ careerSlug: career.slug }}
+            >
               Open roadmap <ArrowRight size={15} />
             </Link>
           }
@@ -1043,16 +1696,108 @@ function CareerDetail() {
 }
 
 function Roadmap() {
-  const [completed, setCompleted] = useState([0]);
-  const steps = careers[0].roadmap;
-  const percent = Math.round((completed.length / steps.length) * 100);
+  const location = useLocation();
 
-  function toggle(index) {
-    setCompleted((current) =>
-      current.includes(index)
-        ? current.filter((item) => item !== index)
-        : [...current, index]
-    );
+  const requestedSlug =
+    location.state?.careerSlug ||
+    sessionStorage.getItem("careerNavigatorSelectedCareerSlug");
+
+  const career =
+    careers.find((item) => item.slug === requestedSlug) || careers[0];
+
+  const [completed, setCompleted] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [savedMessage, setSavedMessage] = useState("");
+
+  const token = sessionStorage.getItem("careerNavigatorToken");
+  const steps = career.roadmap;
+  const percent = Math.round(
+    (completed.length / Math.max(steps.length, 1)) * 100
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadProgress() {
+      setLoading(true);
+      setError("");
+      setCompleted([]);
+
+      try {
+        if (!token) {
+          throw new Error("Please log in to view your roadmap progress.");
+        }
+
+        const result = await apiRequest(`/roadmaps/${career.slug}/progress`, {
+          token,
+          signal: controller.signal,
+        });
+
+        const savedSteps = result.data?.completedSteps;
+
+        if (!Array.isArray(savedSteps)) {
+          throw new Error("The server returned invalid roadmap progress.");
+        }
+
+        if (!controller.signal.aborted) {
+          const validSteps = savedSteps.filter((id) => {
+            const match = /^step-(\d+)$/.exec(id);
+            return match && Number(match[1]) < steps.length;
+          });
+
+          setCompleted([...new Set(validSteps)]);
+          sessionStorage.setItem(
+            "careerNavigatorSelectedCareerSlug",
+            career.slug
+          );
+        }
+      } catch (err) {
+        if (err.name !== "AbortError" && !controller.signal.aborted) {
+          setError(err.message || "Unable to load roadmap progress.");
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadProgress();
+
+    return () => controller.abort();
+  }, [career.slug, token, steps.length]);
+
+  async function toggle(index) {
+    if (saving || loading) return;
+
+    const stepId = `step-${index}`;
+    const previous = completed;
+
+    const next = previous.includes(stepId)
+      ? previous.filter((id) => id !== stepId)
+      : [...previous, stepId];
+
+    setCompleted(next);
+    setSaving(true);
+    setError("");
+    setSavedMessage("");
+
+    try {
+      await apiRequest(`/roadmaps/${career.slug}/progress`, {
+        method: "PUT",
+        token,
+        body: { completedSteps: next },
+      });
+
+      setSavedMessage("Progress saved to your account.");
+    } catch (err) {
+      setCompleted(previous);
+      setError(err.message || "Unable to save progress.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -1060,56 +1805,83 @@ function Roadmap() {
       <PageHeader
         eyebrow="YOUR ACTION PLAN"
         title="My roadmap"
-        description="Track learning milestones as you explore a career direction."
+        description="Work through milestones and track your progress for each career."
       />
+
       <div className="roadmap-banner panel">
         <div className="roadmap-banner-icon">
           <Compass size={27} />
         </div>
+
         <div className="roadmap-banner-copy">
-          <div className="eyebrow">SAMPLE ROADMAP</div>
-          <h2>Software Developer</h2>
+          <div className="eyebrow">CAREER ROADMAP</div>
+          <h2>{career.title}</h2>
           <p>
-            A starter plan for learning fundamentals and building practical
-            experience.
+            Follow these suggested steps to build skills and practical
+            experience for this career path.
           </p>
         </div>
+
         <div className="roadmap-banner-progress">
           <strong>{percent}%</strong>
           <span>complete</span>
           <ProgressBar value={percent} color="mint" />
         </div>
       </div>
+
       <section className="panel roadmap-list">
         <SectionHeading
           title="Milestones"
-          subtitle={`${completed.length} of ${steps.length} marked complete in this session`}
+          subtitle={`${completed.length} of ${steps.length} completed`}
         />
-        {steps.map((step, index) => {
-          const done = completed.includes(index);
-          return (
-            <button
-              className={`milestone-row${done ? " milestone-done" : ""}`}
-              key={step}
-              onClick={() => toggle(index)}
-              aria-pressed={done}
-            >
-              <span className={`milestone-check${done ? " checked" : ""}`}>
-                {done && <Check size={15} />}
-              </span>
-              <span className="milestone-content">
-                <strong>{step}</strong>
-                <small>{done ? "Marked complete" : "Not completed yet"}</small>
-              </span>
-              <span className="milestone-step">STEP {index + 1}</span>
-            </button>
-          );
-        })}
+
+        {loading && <p>Loading saved progress...</p>}
+
+        {!loading &&
+          steps.map((step, index) => {
+            const stepId = `step-${index}`;
+            const done = completed.includes(stepId);
+
+            return (
+              <button
+                type="button"
+                className={`milestone-row${done ? " milestone-done" : ""}`}
+                key={stepId}
+                onClick={() => toggle(index)}
+                disabled={saving}
+                aria-pressed={done}
+              >
+                <span className={`milestone-check${done ? " checked" : ""}`}>
+                  {done && <Check size={15} />}
+                </span>
+
+                <span className="milestone-content">
+                  <strong>{step}</strong>
+                  <small>
+                    {done ? "Marked complete" : "Not completed yet"}
+                  </small>
+                </span>
+
+                <span className="milestone-step">STEP {index + 1}</span>
+              </button>
+            );
+          })}
+
+        {error && (
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        {savedMessage && <p role="status">{savedMessage}</p>}
+
+        {saving && <p>Saving your progress...</p>}
+
         <div className="demo-notice">
-          <CircleHelp size={17} />
+          <ShieldCheck size={17} />
           <span>
-            Milestone changes live in React state and reset on refresh. Saving
-            progress is part of the backend phase.
+            Your completed milestones are stored with your account. Progress is
+            tracked separately for each career.
           </span>
         </div>
       </section>
@@ -1118,133 +1890,281 @@ function Roadmap() {
 }
 
 function History() {
+  const [attempts, setAttempts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function loadHistory() {
+      try {
+        const token = sessionStorage.getItem("careerNavigatorToken");
+
+        if (!token) {
+          throw new Error("Please log in to view your assessment history.");
+        }
+
+        const result = await apiRequest("/assessments/history", {
+          token,
+          signal: controller.signal,
+        });
+
+        const items = result.data?.attempts;
+
+        if (!Array.isArray(items)) {
+          throw new Error("The server returned an invalid history response.");
+        }
+
+        setAttempts(items);
+      } catch (err) {
+        if (err.name !== "AbortError" && !controller.signal.aborted) {
+          setError(err.message || "Unable to load assessment history.");
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadHistory();
+    return () => controller.abort();
+  }, []);
+
+  function formatDate(value) {
+    if (!value) return "Date unavailable";
+
+    const date = new Date(value);
+
+    return Number.isNaN(date.getTime())
+      ? "Date unavailable"
+      : date.toLocaleString();
+  }
+
   return (
     <>
       <PageHeader
         eyebrow="YOUR ACTIVITY"
         title="Assessment history"
-        description="Review previous assessment and recommendation activity."
+        description="Review your saved assessment attempts and completion status."
+        action={
+          <Link className="button button-primary" to="/app/assessment">
+            Take assessment
+          </Link>
+        }
       />
+
       <section className="panel table-panel">
         <SectionHeading
-          title="Recent activity"
-          subtitle="Illustrative entries for the interface prototype."
+          title="Your assessment attempts"
+          subtitle={`${attempts.length} saved attempt${
+            attempts.length === 1 ? "" : "s"
+          }`}
         />
-        <div className="history-list">
-          <div className="history-row">
-            <span className="history-icon">
-              <ClipboardCheck size={19} />
-            </span>
-            <div>
-              <strong>Career assessment</strong>
-              <small>Demo entry · Current session</small>
-            </div>
-            <span className="status-tag pending">In progress</span>
-            <span className="history-score">—</span>
+
+        {loading && <p>Loading your assessment history...</p>}
+
+        {!loading && error && (
+          <div className="form-error" role="alert">
+            {error}
           </div>
-          <div className="history-row">
-            <span className="history-icon mint">
-              <Sparkles size={19} />
-            </span>
-            <div>
-              <strong>Career recommendations preview</strong>
-              <small>Sample data · Not model-generated</small>
-            </div>
-            <span className="status-tag">Preview</span>
-            <span className="history-score">5 paths</span>
+        )}
+
+        {!loading && !error && attempts.length === 0 && (
+          <div className="empty-state">
+            <Clock3 size={28} />
+            <h3>No assessment history yet</h3>
+            <p>
+              Complete your first career assessment to see your saved attempts
+              here.
+            </p>
+            <Link className="button button-primary" to="/app/assessment">
+              Start assessment
+            </Link>
           </div>
-        </div>
-        <div className="empty-note">
-          Real attempt timestamps and saved results will appear after backend
-          persistence is implemented.
-        </div>
+        )}
+
+        {!loading && !error && attempts.length > 0 && (
+          <div className="history-list">
+            {attempts.map((attempt) => {
+              const complete = attempt.status === "completed";
+
+              return (
+                <div className="history-row" key={attempt.id}>
+                  <span className={`history-icon${complete ? " mint" : ""}`}>
+                    {complete ? (
+                      <CheckCircle2 size={19} />
+                    ) : (
+                      <Clock3 size={19} />
+                    )}
+                  </span>
+
+                  <div>
+                    <strong>Career assessment</strong>
+                    <small>
+                      {formatDate(attempt.submittedAt || attempt.startedAt)}
+                    </small>
+                    <small>
+                      {attempt.answeredCount} of {attempt.questionCount}{" "}
+                      questions answered
+                    </small>
+                  </div>
+
+                  <span className={`status-tag${complete ? "" : " pending"}`}>
+                    {complete ? "Completed" : "In progress"}
+                  </span>
+
+                  <span className="history-score">
+                    {complete ? "Scores saved" : "Draft"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
     </>
   );
 }
 
 function Progress() {
-  const bars = [
-    { label: "Assessment", value: 0 },
-    { label: "Career exploration", value: 60 },
-    { label: "Roadmap milestones", value: 20 },
-    { label: "Learning resources", value: 10 },
-  ];
+  const { summary, loading, error } = useSavedRoadmapSummary();
+
   return (
     <>
       <PageHeader
         eyebrow="YOUR DEVELOPMENT"
         title="Progress overview"
-        description="A simple view of the areas you can work on during your career journey."
+        description="Track the learning milestones you've completed across your career roadmaps."
       />
-      <div className="stats-grid">
-        <StatCard
-          icon={Target}
-          label="Assessment"
-          value="Pending"
-          detail="Complete the demo questions"
-          tone="blue"
-        />
-        <StatCard
-          icon={BriefcaseBusiness}
-          label="Careers explored"
-          value="5"
-          detail="Sample directory entries"
-          tone="mint"
-        />
-        <StatCard
-          icon={CheckCircle2}
-          label="Milestones"
-          value="1 / 5"
-          detail="Local demo state"
-          tone="purple"
-        />
-        <StatCard
-          icon={Clock3}
-          label="Learning hours"
-          value="—"
-          detail="Real time tracking not enabled"
-          tone="orange"
-        />
-      </div>
-      <section className="panel progress-breakdown">
-        <SectionHeading
-          title="Journey breakdown"
-          subtitle="Illustrative values to preview the dashboard."
-        />
-        {bars.map((bar) => (
-          <div className="breakdown-row" key={bar.label}>
-            <div>
-              <span>{bar.label}</span>
-              <strong>{bar.value}%</strong>
-            </div>
-            <ProgressBar
-              value={bar.value}
-              color={bar.value >= 50 ? "mint" : "blue"}
+
+      {loading ? (
+        <section className="panel">
+          <p>Loading your saved progress...</p>
+        </section>
+      ) : error ? (
+        <section className="panel">
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        </section>
+      ) : (
+        <>
+          <div className="stats-grid">
+            <StatCard
+              icon={TrendingUp}
+              label="Overall roadmap completion"
+              value={`${summary.percent}%`}
+              detail="Across available career roadmaps"
+              tone="blue"
+            />
+
+            <StatCard
+              icon={CheckCircle2}
+              label="Completed milestones"
+              value={summary.completed}
+              detail={`Out of ${summary.total} available milestones`}
+              tone="mint"
+            />
+
+            <StatCard
+              icon={BriefcaseBusiness}
+              label="Roadmaps started"
+              value={summary.trackedCareers}
+              detail="Career roadmaps with completed milestones"
+              tone="purple"
             />
           </div>
-        ))}
-        <div className="demo-notice">
-          <CircleHelp size={17} />
-          <span>
-            These values are examples, not tracked personal activity or a
-            measure of career readiness.
-          </span>
-        </div>
-      </section>
+
+          <section className="panel progress-breakdown">
+            <SectionHeading
+              title="Roadmap progress by career"
+              subtitle="Open any roadmap to continue working through its milestones."
+            />
+
+            {summary.perCareer.map((item) => (
+              <div className="breakdown-row" key={item.slug}>
+                <div>
+                  <Link to="/app/roadmap" state={{ careerSlug: item.slug }}>
+                    {item.title}
+                  </Link>
+                  <strong>{item.percent}%</strong>
+                </div>
+
+                <ProgressBar
+                  value={item.percent}
+                  color={item.percent === 100 ? "mint" : "blue"}
+                />
+
+                <small>
+                  {item.completed} of {item.total} milestones completed
+                </small>
+              </div>
+            ))}
+          </section>
+        </>
+      )}
     </>
   );
 }
 
 function Profile() {
+  const savedUser = JSON.parse(
+    sessionStorage.getItem("careerNavigatorUser") || "{}"
+  );
   const [profile, setProfile] = useState({
-    name: "Animesh Khare",
-    email: "student@example.com",
+    name: savedUser.name || "",
+    email: savedUser.email || "",
     education: "Engineering student",
-    interests: "Software, data, problem solving",
+    interests: "",
   });
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const initials = profile.name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+  useEffect(() => {
+    const controller = new AbortController();
 
+    async function loadProfile() {
+      try {
+        const token = sessionStorage.getItem("careerNavigatorToken");
+        if (!token) return;
+
+        const result = await apiRequest("/auth/me", {
+          token,
+          signal: controller.signal,
+        });
+
+        const user = result.data.user;
+
+        setProfile((current) => ({
+          ...current,
+          name: user.name || "",
+          email: user.email || "",
+          education: user.education || "",
+          interests: user.interests || "",
+        }));
+
+        sessionStorage.setItem("careerNavigatorUser", JSON.stringify(user));
+      } catch (error) {
+        if (error.name !== "AbortError") {
+          setProfileError(error.message || "Unable to load your profile.");
+        }
+      }
+    }
+
+    loadProfile();
+
+    return () => controller.abort();
+  }, []);
   function update(event) {
     setProfile((current) => ({
       ...current,
@@ -1253,9 +2173,50 @@ function Profile() {
     setSaved(false);
   }
 
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
-    setSaved(true);
+    setSaving(true);
+    setSaved(false);
+    setProfileError("");
+
+    try {
+      const token = sessionStorage.getItem("careerNavigatorToken");
+
+      if (!token) {
+        throw new Error("Please log in again.");
+      }
+
+      const result = await apiRequest("/auth/me", {
+        method: "PATCH",
+        token,
+        body: {
+          name: profile.name,
+          education: profile.education,
+          interests: profile.interests,
+        },
+      });
+
+      const updatedUser = result.data.user;
+
+      sessionStorage.setItem(
+        "careerNavigatorUser",
+        JSON.stringify(updatedUser)
+      );
+
+      setProfile((current) => ({
+        ...current,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        education: updatedUser.education || "",
+        interests: updatedUser.interests || "",
+      }));
+
+      setSaved(true);
+    } catch (error) {
+      setProfileError(error.message || "Unable to save your profile.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -1263,14 +2224,14 @@ function Profile() {
       <PageHeader
         eyebrow="YOUR INFORMATION"
         title="My profile"
-        description="Review and edit the details used in this local UI preview."
+        description="Review your account details and personal career interests."
       />
       <div className="profile-layout">
         <section className="panel profile-summary">
-          <div className="profile-avatar-large">AK</div>
+          <div className="profile-avatar-large">{initials || "U"}</div>
           <h2>{profile.name || "Your name"}</h2>
           <p>{profile.education}</p>
-          <span className="status-tag pending">Demo profile</span>
+          <span className="status-tag pending">Registered account</span>
           <div className="profile-summary-note">
             <ShieldCheck size={17} />
             <span>
@@ -1282,7 +2243,7 @@ function Profile() {
         <section className="panel profile-form-panel">
           <SectionHeading
             title="Profile details"
-            subtitle="Fields to connect to your student profile later."
+            subtitle="Manage your student profile details."
           />
           <form className="form-stack" onSubmit={submit}>
             <label className="field-label">
@@ -1325,9 +2286,14 @@ function Profile() {
                 onChange={update}
               />
             </label>
+            {profileError && (
+              <div className="form-error" role="alert">
+                {profileError}
+              </div>
+            )}
             {saved && (
-              <div className="success-message" role="status">
-                <CheckCircle2 size={17} /> Demo profile changes applied locally.
+              <div className="form-success" role="status">
+                Profile saved successfully.
               </div>
             )}
             <button className="button button-primary" type="submit">
@@ -1612,14 +2578,29 @@ function NotFound() {
     </div>
   );
 }
+function ProtectedRoute({ children }) {
+  const token = sessionStorage.getItem("careerNavigatorToken");
 
+  if (!token) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return children;
+}
 function AppRoutes() {
   return (
     <Routes>
       <Route path="/" element={<LandingPage />} />
       <Route path="/login" element={<AuthPage />} />
       <Route path="/register" element={<AuthPage register />} />
-      <Route path="/app" element={<AppLayout />}>
+      <Route
+        path="/app"
+        element={
+          <ProtectedRoute>
+            <AppLayout />
+          </ProtectedRoute>
+        }
+      >
         <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="profile" element={<Profile />} />

@@ -42,6 +42,8 @@ function publicUser(user) {
         name: user.name,
         email: user.email,
         role: user.role,
+        education: user.education || "",
+        interests: user.interests || "",
         createdAt: user.createdAt,
     };
 }
@@ -106,14 +108,20 @@ router.post("/register", authLimiter, async (req, res, next) => {
             passwordHash,
         });
 
-        const token = createToken(user);
+        const token = jwt.sign(
+            { id: user._id, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN || "1d" }
+        );
 
         return res.status(201).json({
-            success: true,
-            message: "Account created successfully.",
-            data: {
-                user: publicUser(user),
-                token,
+            message: "Registration successful",
+            token,
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
             },
         });
     } catch (error) {
@@ -195,5 +203,74 @@ router.get("/me", requireAuth, async (req, res, next) => {
         next(error);
     }
 });
+
+// PATCH /api/auth/me
+router.patch("/me", requireAuth, async (req, res, next) => {
+    try {
+        const { name, education, interests } = req.body ?? {};
+
+        const updates = {};
+
+        if (name !== undefined) {
+            if (typeof name !== "string" || name.trim().length < 2 ||
+                name.trim().length > 80) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Name must be between 2 and 80 characters.",
+                });
+            }
+            updates.name = name.trim();
+        }
+
+        if (education !== undefined) {
+            if (typeof education !== "string" || education.length > 120) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Education must be 120 characters or fewer.",
+                });
+            }
+            updates.education = education.trim();
+        }
+
+        if (interests !== undefined) {
+            if (typeof interests !== "string" || interests.length > 1000) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Interests must be 1000 characters or fewer.",
+                });
+            }
+            updates.interests = interests.trim();
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Provide at least one profile field to update.",
+            });
+        }
+
+        const user = await User.findByIdAndUpdate(
+            req.user.id,
+            { $set: updates },
+            { new: true, runValidators: true }
+        );
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found.",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Profile updated successfully.",
+            data: { user: publicUser(user) },
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 
 export default router;

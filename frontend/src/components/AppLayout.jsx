@@ -70,9 +70,22 @@ export default function AppLayout({ admin = false }) {
   }
 
   function demoLogout() {
-    navigate("/");
+    sessionStorage.removeItem("careerNavigatorToken");
+    sessionStorage.removeItem("careerNavigatorUser");
+    navigate("/", { replace: true });
   }
+  const savedUser = JSON.parse(
+    sessionStorage.getItem("careerNavigatorUser") || "{}"
+  );
 
+  const displayName = savedUser.name || "Student";
+  const initials = displayName
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
   return (
     <div className="app-shell">
       {mobileOpen && (
@@ -133,7 +146,7 @@ export default function AppLayout({ admin = false }) {
 
           <button className="nav-link logout-link" onClick={demoLogout}>
             <LogOut size={18} />
-            <span>Exit demo</span>
+            <span>Exit</span>
           </button>
         </div>
       </aside>
@@ -155,7 +168,7 @@ export default function AppLayout({ admin = false }) {
           </div>
 
           <div className="topbar-actions">
-            <span className="demo-label">DEMO MODE</span>
+            {/* <span className="demo-label">DEMO MODE</span> */}
             <button
               className="icon-button notification-button"
               aria-label="View notifications"
@@ -169,12 +182,10 @@ export default function AppLayout({ admin = false }) {
               onClick={() => navigate(admin ? "/admin" : "/app/profile")}
               aria-label="Open profile"
             >
-              <span className="avatar">AK</span>
+              <span className="avatar">{admin ? "AD" : initials}</span>
               <span className="profile-chip-name">
-                <strong>{admin ? "Administrator" : "Animesh Khare"}</strong>
-                <small>
-                  {admin ? "Admin preview" : "Student account preview"}
-                </small>
+                <strong>{admin ? "Administrator" : displayName}</strong>
+                <small>{admin ? "Admin workspace" : "Student account"}</small>
               </span>
             </button>
           </div>
@@ -186,7 +197,7 @@ export default function AppLayout({ admin = false }) {
 
         <footer className="app-footer">
           <span>Career Navigator</span>
-          <span>Prototype · Sample data only</span>
+          <span>Prototype · v1</span>
         </footer>
       </div>
     </div>
